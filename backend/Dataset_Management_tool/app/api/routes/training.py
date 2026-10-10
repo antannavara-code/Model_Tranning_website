@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+try:
+    import cv2
+except Exception:
+    cv2 = None
 import tempfile
 import requests
 from urllib.parse import urlparse
@@ -31,6 +35,8 @@ import cv2
 import numpy as np
 import torch
 import albumentations as A
+import cv2
+import cv2
 from albumentations.pytorch import ToTensorV2
 import mlflow
 from ultralytics import YOLO
@@ -67,7 +73,7 @@ def get_training_cfg(params: Dict[str, Any], dataset_path: str, data_yaml: str) 
         warmup_bias_lr  = 0.1,
         cos_lr          = True,
         amp             = True,
-        cache           = "disk",
+        cache           = "ram",
         patience        = params.get("patience", 0),
         save_period     = -1,  # save only best + last (no intermediate checkpoints)
         # ── Loss weights (small fast objects need strong box loss) ────────────────
@@ -78,6 +84,7 @@ def get_training_cfg(params: Dict[str, Any], dataset_path: str, data_yaml: str) 
         multi_scale     = False,
         overlap_mask    = False,
         # ── Output ────────────────────────────────────────────────────────────────
+        job_id          = params.get("job_id", "unknown"),
         project         = str(TRAINING_JOBS_DIR / params.get("job_id", "unknown") / "runs"),
         name            = params.get("run_name", f"exp_{datetime.now().strftime('%Y%m%d_%H%M')}"),
         # ── MLflow ────────────────────────────────────────────────────────────────
@@ -98,8 +105,8 @@ def build_train_transform() -> A.Compose:
     bp = A.BboxParams(
         format         = "yolo",
         label_fields   = ["class_labels"],
-        min_area       = 9,
-        min_visibility = 0.20,
+        min_area       = 4,
+        min_visibility = 0.10,
     )
     return A.Compose([
         # ── A. MOTION BLUR ─────────────────────────────────────────────────
@@ -172,7 +179,7 @@ def build_train_transform() -> A.Compose:
             shear=(-6, 6), p=0.35),
         A.Perspective(scale=(0.02, 0.07), p=0.30),
         A.HorizontalFlip(p=0.50),
-        A.VerticalFlip(p=0.10),
+        # A.VerticalFlip disabled for aerial/UAV imagery
         # ── F. STREAM / ENCODING ARTEFACTS ────────────────────────────────
         A.ImageCompression(quality_range=(40, 90), p=0.30),
         A.Defocus(radius=(1, 4), alias_blur=(0.1, 0.5), p=0.15),
@@ -211,7 +218,6 @@ def build_val_transform() -> A.Compose:
 def _process_single_image(args):
     img_path, src_lbl_dir, dst_img_dir, dst_lbl_dir, multiplier, mode = args
     try:
-        import cv2
         from pathlib import Path
         import albumentations as A
         
@@ -238,7 +244,11 @@ def _process_single_image(args):
         for i in range(multiplier):
             try:
                 aug = transform(image=image, bboxes=bboxes, class_labels=classes)
-                versions.append((f"a{i:02d}", aug["image"], aug["bboxes"], aug["class_labels"]))
+                ab, ac = list(aug.get("bboxes", [])), list(aug.get("class_labels", []))
+                # If any boxes dropped, keep original to avoid manufacturing false negatives
+                if len(ab) < len(bboxes) and len(bboxes) > 0:
+                    ab, ac = bboxes[:], classes[:]
+                versions.append((f"a{i:02d}", aug["image"], ab, ac))
             except Exception:
                 pass
 
@@ -261,7 +271,7 @@ def write_augmented_split(
     src_lbl_dir : str,
     dst_img_dir : str,
     dst_lbl_dir : str,
-    multiplier  : int = 4,
+    multiplier  : int = 2,
     mode        : str = "train",
     job         : dict = None,
 ) -> int:
@@ -301,7 +311,7 @@ def write_augmented_split(
     return written
 
 
-def build_augmented_dataset(cfg: dict, multiplier: int = 4, job: dict = None) -> str:
+def build_augmented_dataset(cfg: dict, multiplier: int = 2, job: dict = None) -> str:
     root     = Path(cfg["dataset_root"])
     aug_root = root / "augmented"
 
@@ -536,38 +546,50 @@ def advanced_train(cfg: dict = None, use_albumentations: bool = True, aug_mult: 
                 print("Stopping YOLO training loop due to user cancellation.")
                 trainer.stop = True
                 return
-
-            # Extract mAP50-95 from trainer metrics
-            # Note: YOLOv8 uses specific keys in trainer.metrics
-            metrics = trainer.metrics
-            # Try multiple common keys for mAP50-95; stay None if not available yet
-            current_map = metrics.get('metrics/mAP50-95(B)')
-            if current_map is None:
-                current_map = metrics.get('mAP50-95')
-            
-            # Update job metrics for frontend real-time tracking
+            # This callback runs BEFORE validation, so trainer.metrics still holds
+            # stale/zero values. Update only the epoch counter here; real metric
+            # values are captured in on_fit_epoch_end below (after validation).
             if job:
-                from app.core.database import SessionLocal
                 if job.get("metrics") is None:
                     job["metrics"] = {}
                 job["metrics"]["epoch"] = trainer.epoch + 1
                 job["metrics"]["total_epochs"] = trainer.epochs
-                if metrics:
-                    job["metrics"]["mAP50"] = metrics.get('metrics/mAP50(B)', 0.0)
-                    job["metrics"]["mAP50_95"] = current_map
-                    job["metrics"]["precision"] = metrics.get('metrics/precision(B)', 0.0)
-                    job["metrics"]["recall"] = metrics.get('metrics/recall(B)', 0.0)
-                try:
-                    db_session = SessionLocal()
-                    _save_job_to_db(job, db_session)
-                    db_session.close()
-                except Exception:
-                    pass
 
-            if early_stopper.step(current_map, trainer.model):
-                trainer.stop = True
+        def on_fit_epoch_end_early_stop(trainer):
+            if not (job and job.get("stop_requested")):
+                metrics = trainer.metrics or {}
+                current_map = metrics.get('metrics/mAP50-95(B)')
+                if current_map is None:
+                    current_map = metrics.get('mAP50-95')
+                if job:
+                    if job.get("metrics") is None:
+                        job["metrics"] = {}
+                    if metrics:
+                        job["metrics"]["mAP50"] = metrics.get('metrics/mAP50(B)', 0.0)
+                        job["metrics"]["mAP50_95"] = current_map if current_map is not None else 0.0
+                        job["metrics"]["precision"] = metrics.get('metrics/precision(B)', 0.0)
+                        job["metrics"]["recall"] = metrics.get('metrics/recall(B)', 0.0)
+                    _append_log(
+                        job,
+                        f"Epoch {job['metrics'].get('epoch', trainer.epoch + 1)}/{trainer.epochs} "
+                        f"done — mAP50: {job['metrics'].get('mAP50', 0.0):.4f}, "
+                        f"mAP50-95: {job['metrics'].get('mAP50_95', 0.0):.4f}"
+                    )
+                if early_stopper.step(current_map, trainer.model):
+                    if job:
+                        job["stop_requested"] = True
+                    trainer.stop = True
+                if job:
+                    try:
+                        from app.core.database import SessionLocal
+                        db_session = SessionLocal()
+                        _save_job_to_db(job, db_session)
+                        db_session.close()
+                    except Exception:
+                        pass
 
         model.add_callback("on_train_epoch_end", on_train_epoch_end_early_stop)
+        model.add_callback("on_fit_epoch_end", on_fit_epoch_end_early_stop)
 
         # ── YOLO train ────────────────────────────────────────────────────────
         # Disable YOLO's built-in early stopping when custom EarlyStopping is active
@@ -601,16 +623,16 @@ def advanced_train(cfg: dict = None, use_albumentations: bool = True, aug_mult: 
             exist_ok        = True,
             verbose         = True,
             # ── YOLO built-in augmentation (adds diversity on top of Albumentations)
-            mosaic          = 1.0,
+            mosaic          = 0.5,
             mixup           = 0.15,
-            copy_paste      = 0.10,
+            copy_paste      = 0.0,
             hsv_h           = 0.015,
             hsv_s           = 0.4,
             hsv_v           = 0.3,
             degrees         = 10.0,
             translate       = 0.1,
             scale           = 0.5,
-            flipud          = 0.1,
+            flipud          = 0.0,
             fliplr          = 0.5,
             perspective    = 0.0005,
         )
@@ -688,6 +710,8 @@ class TrainingStartRequest(BaseModel):
     model_description: Optional[str] = None
     # Set to 0 to disable early stopping; any positive value enables early‑stop after that many epochs.
     patience: int = Field(0, ge=0, le=1000)
+    # Optional absolute path to a checkpoint (e.g. last.pt) to RESUME training from.
+    resume_from: Optional[str] = None
 
 
 class TrainingJobResponse(BaseModel):
@@ -758,6 +782,33 @@ def _cleanup_dead_threads():
                 pass
 
 
+def sweep_stale_jobs():
+    """On backend startup, mark any DB jobs still 'queued'/'preparing'/'running'
+    as failed — those belong to a previous backend process that no longer has a
+    live training thread. Prevents phantom 'running' jobs in the dashboard."""
+    from app.core.database import SessionLocal
+    try:
+        db = SessionLocal()
+        stale = db.query(TrainingJob).filter(
+            TrainingJob.status.in_(["queued", "preparing", "running"])
+        ).all()
+        for rec in stale:
+            rec.status = "failed"
+            rec.error = ("Training job interrupted (backend restarted / process ended). "
+                         "Resume from the latest checkpoint to continue.")
+            rec.finished_at = datetime.utcnow()
+            print(f"[startup] marked stale job failed: {rec.id}")
+        db.commit()
+        db.close()
+    except Exception as e:
+        try:
+            db.rollback()
+            db.close()
+        except Exception:
+            pass
+        print(f"[startup] sweep_stale_jobs error: {e}")
+
+
 def _append_log(job: Dict[str, Any], message: str) -> None:
     ts = datetime.utcnow().strftime("%H:%M:%S")
     job["logs"].append(f"[{ts}] {message}")
@@ -822,6 +873,9 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"})
+
+
 def _count_job_dataset_images(job_id: str) -> int:
     job_dir = TRAINING_JOBS_DIR / job_id / "dataset"
     if not job_dir.exists():
@@ -831,7 +885,7 @@ def _count_job_dataset_images(job_id: str) -> int:
     for split in ["train", "val", "test"]:
         split_images = job_dir / split / "images"
         if split_images.exists() and split_images.is_dir():
-            image_count += sum(1 for item in split_images.iterdir() if item.is_file())
+            image_count += sum(1 for item in split_images.iterdir() if item.is_file() and item.suffix.lower() in _IMAGE_EXTENSIONS)
     return image_count
 
 
@@ -1162,9 +1216,12 @@ def _prepare_yolo_dataset(
                 invalid_images.append((img.file_name, f"Image not in 'images' directory: {img_path}"))
                 continue
             
-            # Replace "images" with "labels" in the path
-            idx = parts.index("images")
-            label_parts = parts[:idx] + ["labels"] + parts[idx+1:]
+            # Replace last "images" with "labels" in the path (robust to ancestor dirs named "images")
+            idx = len(parts) - 1 - list(reversed(parts)).index("images") if "images" in parts else -1
+            if idx < 0:
+                invalid_images.append((img.file_name, f"Image not in 'images' directory: {img_path}"))
+                continue
+            label_parts = list(parts[:idx]) + ["labels"] + list(parts[idx+1:])
             
             # Create label path with .txt extension (using stem to preserve name without extension)
             label_path = Path(*label_parts).parent / (Path(img_path).stem + ".txt")
@@ -1201,23 +1258,50 @@ def _prepare_yolo_dataset(
     _append_log(job, f"Validated {len(pairs)} image/label pairs - all real uploaded data")
     
     # Shuffle and split using deterministic seed for reproducibility
+    # Group-aware split for video frames: group by basename prefix to avoid leakage
+    import re
+    def _group_key(fn):
+        from pathlib import Path
+        stem = Path(str(fn)).stem
+        m = re.match(r'^(.*?)(\d+)$', stem)
+        if m:
+            return m.group(1), int(m.group(2))  # keep order of same prefix together loosely
+        m = re.findall(r'\d+', stem)
+        return (stem[:8] if stem else stem, int(m[-1]) if m else hash(stem) % 1000)
+    # stable grouping
+    grouped = {}
+    for p in pairs:
+        k = _group_key(p[2])
+        grouped.setdefault(k[0] if isinstance(k,tuple) else k, []).append(p)
+    groups = list(grouped.values())
     rng = random.Random(seed)
-    rng.shuffle(pairs)
-
+    rng.shuffle(groups)
+    # interleave? no; assign whole groups to splits preserving sizes
     total = len(pairs)
     n_test = int(total * test_split)
     n_val = int(total * val_split)
     n_train = total - n_test - n_val
-    
     if n_train <= 0:
         raise ValueError(f"Invalid split sizes for {total} images. Train split became empty. "
                         f"Consider reducing val_split ({val_split}) and test_split ({test_split}).")
-    
-    _append_log(job, f"Split data: train={n_train}, val={n_val}, test={n_test}")
-
-    train_pairs = pairs[:n_train]
-    val_pairs = pairs[n_train:n_train + n_val] if n_val > 0 else []
-    test_pairs = pairs[n_train + n_val:] if n_test > 0 else []
+    train_pairs, val_pairs, test_pairs = [], [], []
+    rem = total
+    # assign: test, then val, then train
+    for g in groups:
+        if len(test_pairs) < n_test and rem > 0:
+            take = min(len(g), n_test - len(test_pairs))
+            test_pairs.extend(g[:take]); g = g[take:]; rem -= take
+        if g and len(val_pairs) < n_val and rem > 0:
+            take = min(len(g), n_val - len(val_pairs))
+            val_pairs.extend(g[:take]); g = g[take:]; rem -= take
+        if g:
+            train_pairs.extend(g); rem -= len(g)
+    # if still imbalanced (edge cases), rebalance from train to satisfy
+    if len(val_pairs) < n_val and train_pairs:
+        need = n_val - len(val_pairs); take = train_pairs[:need]; val_pairs.extend(take); train_pairs = train_pairs[need:]
+    if len(test_pairs) < n_test and train_pairs:
+        need = n_test - len(test_pairs); take = train_pairs[:need]; test_pairs.extend(take); train_pairs = train_pairs[need:]
+    _append_log(job, f"Split data (grouped): train={len(train_pairs)}, val={len(val_pairs)}, test={len(test_pairs)}")
 
     # Create training directory structure
     job_dir = TRAINING_JOBS_DIR / job["job_id"]
@@ -1339,14 +1423,30 @@ def _run_training(job_id: str) -> None:
 
         dataset = db.query(Dataset).filter(Dataset.id == job["dataset_id"]).first()
         class_rows = db.query(ClassDistribution).filter(ClassDistribution.dataset_id == job["dataset_id"]).all()
-        prepared = _prepare_yolo_dataset(
-            dataset_id=job["dataset_id"],
-            seed=job["params"]["seed"],
-            val_split=job["params"]["val_split"],
-            test_split=job["params"]["test_split"],
-            db=db,
-            job=job,
-        )
+
+        resume_from = job["params"].get("resume_from")
+        resuming = bool(resume_from)
+        if resuming:
+            # Reuse the checkpoint's existing job dataset instead of re-preparing.
+            resume_pt = Path(resume_from)
+            resume_job_dir = resume_pt.parents[2]  # from .../runs/train/weights/last.pt -> job dir
+            prepared = {
+                "job_dir": resume_job_dir,
+                "yaml_path": resume_job_dir / "data.yaml",
+                "n_train": len(list((resume_job_dir / "dataset" / "train" / "images").glob("*"))),
+                "n_val": len(list((resume_job_dir / "dataset" / "val" / "images").glob("*"))),
+                "n_test": len(list((resume_job_dir / "dataset" / "test" / "images").glob("*"))),
+            }
+            _append_log(job, f"RESUME detected: continuing from checkpoint {resume_pt}")
+        else:
+            prepared = _prepare_yolo_dataset(
+                dataset_id=job["dataset_id"],
+                seed=job["params"]["seed"],
+                val_split=job["params"]["val_split"],
+                test_split=job["params"]["test_split"],
+                db=db,
+                job=job,
+            )
         # Check for cancellation before starting heavy training step
         if job.get("stop_requested"):
             _update_job(job_id, {
@@ -1463,7 +1563,7 @@ def _run_training(job_id: str) -> None:
             _save_job_to_db(job, db)
             return
 
-        _append_log(job, "Running advanced YOLO training with Albumentations and MLflow.")
+        _append_log(job, "Resuming YOLO training from checkpoint." if resuming else "Running advanced YOLO training with Albumentations and MLflow.")
         _save_job_to_db(job, db)
 
         # Generate CFG for advanced training
@@ -1499,20 +1599,52 @@ def _run_training(job_id: str) -> None:
             def __init__(self, job: Dict[str, Any], orig_stream):
                 self.job = job
                 self.orig = orig_stream
+                self._buf = ""
+
+            def _is_progress_line(self, line: str) -> bool:
+                # TQDM/TorchMetrics progress bars: contain "it/s" or "s/it" speed markers,
+                # or the Ultralytics per-epoch TQDM bar with an it/s tail.
+                return bool(
+                    "it/s" in line or "s/it" in line
+                    or line.strip().endswith('%|')
+                )
+
+            def _flush_line(self, line: str) -> None:
+                stripped = line.strip()
+                if not stripped:
+                    return
+                logs = self.job["logs"]
+                if self._is_progress_line(stripped):
+                    # Keep only the latest progress-bar redraw: replace the previous
+                    # progress line in place instead of appending thousands of rows.
+                    if logs and self._is_progress_line(logs[-1].split("] ", 1)[-1]):
+                        logs[-1] = f"[{datetime.utcnow().strftime('%H:%M:%S')}] {stripped}"
+                    else:
+                        _append_log(self.job, stripped)
+                else:
+                    _append_log(self.job, stripped)
 
             def write(self, s: str) -> None:
                 # Capture all output, including progress bars. Replace carriage returns with newlines.
                 if s:
-                    cleaned = s.replace('\r', '\n')
-                    for line in cleaned.splitlines():
-                        if line.strip():
-                            _append_log(self.job, line)
+                    self._buf += s
+                    while "\n" in self._buf or "\r" in self._buf:
+                        if "\r" in self._buf:
+                            seg, _, rest = self._buf.partition("\r")
+                        else:
+                            seg, _, rest = self._buf.partition("\n")
+                        self._buf = rest
+                        if seg:
+                            self._flush_line(seg)
                 try:
                     self.orig.write(s)
                 except Exception:
                     pass
 
             def flush(self) -> None:
+                if self._buf:
+                    self._flush_line(self._buf)
+                    self._buf = ""
                 try:
                     self.orig.flush()
                 except Exception:
@@ -1524,14 +1656,68 @@ def _run_training(job_id: str) -> None:
         sys.stdout = interceptor
         sys.stderr = interceptor
         try:
-            # Use advanced training with Albumentations
-            result = advanced_train(
-                cfg=cfg,
-                use_albumentations=job["params"].get("augmentation_enabled", False),
-                aug_mult=4,  # Default multiplier
-                job=job,
-                existing_mlflow_run=existing_mlflow_run
-            )
+            if resuming:
+                from ultralytics import YOLO as _ResumeYOLO
+                _append_log(job, f"Loading checkpoint for resume: {resume_from}")
+                model = _ResumeYOLO(resume_from)
+                # Attach epoch-end callback to update job metrics (like advanced_train)
+                def on_train_epoch_end_resume(trainer):
+                    if job.get("stop_requested"):
+                        print("Stopping YOLO training loop due to user cancellation.")
+                        trainer.stop = True
+                        return
+                    # This callback runs BEFORE validation; update only epoch counter.
+                    if job:
+                        if job.get("metrics") is None:
+                            job["metrics"] = {}
+                        job["metrics"]["epoch"] = trainer.epoch + 1
+                        job["metrics"]["total_epochs"] = trainer.epochs
+
+                def on_fit_epoch_end_resume(trainer):
+                    if not (job and job.get("stop_requested")):
+                        metrics = trainer.metrics or {}
+                        current_map = metrics.get('metrics/mAP50-95(B)')
+                        if current_map is None:
+                            current_map = metrics.get('mAP50-95')
+                        if job:
+                            if job.get("metrics") is None:
+                                job["metrics"] = {}
+                            if metrics:
+                                job["metrics"]["mAP50"] = metrics.get('metrics/mAP50(B)', 0.0)
+                                job["metrics"]["mAP50_95"] = current_map if current_map is not None else 0.0
+                                job["metrics"]["precision"] = metrics.get('metrics/precision(B)', 0.0)
+                                job["metrics"]["recall"] = metrics.get('metrics/recall(B)', 0.0)
+                            _append_log(
+                                job,
+                                f"Epoch {job['metrics'].get('epoch', trainer.epoch + 1)}/{trainer.epochs} "
+                                f"done — mAP50: {job['metrics'].get('mAP50', 0.0):.4f}, "
+                                f"mAP50-95: {job['metrics'].get('mAP50_95', 0.0):.4f}"
+                            )
+                        if job:
+                            try:
+                                from app.core.database import SessionLocal
+                                db_session = SessionLocal()
+                                _save_job_to_db(job, db_session)
+                                db_session.close()
+                            except Exception:
+                                pass
+                model.add_callback("on_train_epoch_end", on_train_epoch_end_resume)
+                model.add_callback("on_fit_epoch_end", on_fit_epoch_end_resume)
+                # Also add stop callback
+                def on_train_epoch_end_stop(trainer):
+                    if job.get("stop_requested"):
+                        trainer.stop = True
+                model.add_callback("on_train_epoch_end", on_train_epoch_end_stop)
+                result = model.train(resume=True, verbose=True)
+            else:
+                # Use advanced training with Albumentations
+                result = advanced_train(
+                    cfg=cfg,
+                    use_albumentations=job["params"].get("augmentation_enabled", False),
+                    aug_mult=4,  # Default multiplier
+                    job=job,
+                    existing_mlflow_run=existing_mlflow_run
+                )
         finally:
             # restore original streams in all cases
             sys.stdout = orig_stdout
@@ -1799,11 +1985,13 @@ async def start_training(request: TrainingStartRequest, db: Session = Depends(ge
         raise HTTPException(status_code=400, detail="val_split + test_split is too large")
 
     job_id = str(uuid.uuid4())
+    params = request.model_dump()
+    params["job_id"] = job_id
     job = {
         "job_id": job_id,
         "status": "queued",
         "dataset_id": request.dataset_id,
-        "params": request.model_dump(),
+        "params": params,
         "created_at": datetime.utcnow().isoformat(),
         "started_at": None,
         "finished_at": None,

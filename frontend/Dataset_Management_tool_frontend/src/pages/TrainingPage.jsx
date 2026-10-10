@@ -282,10 +282,7 @@ function TrainingPage() {
                     >
                         <option value="yolov8n.pt">YOLOv8 Nano (Fast)</option>
                         <option value="yolov8s.pt">YOLOv8 Small</option>
-                        <option value="yolov8m.pt">YOLOv8 Medium</option>
                         <option value="yolo11n.pt">YOLO11 Nano (Fast)</option>
-                        <option value="yolo11s.pt">YOLO11 Small</option>
-                        <option value="yolo11m.pt">YOLO11 Medium</option>
                         <option value="yolo26s.pt">YOLO26 Small</option>
                         <option value="yolo26m.pt">YOLO26 Medium</option>
                         <option value="yolo26l.pt">YOLO26 Large</option>

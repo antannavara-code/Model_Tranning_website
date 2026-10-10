@@ -89,7 +89,7 @@ async def log_requests(request: Request, call_next):
 async def limit_request_size(request: Request, call_next):
 
     if request.url.path.endswith("/upload-dataset"):
-        max_size = 10 * 1024 * 1024 * 1024  # 10GB
+        max_size = 50 * 1024 * 1024 * 1024  # 50GB
     else:
         max_size = 100 * 1024 * 1024  # 100MB
 
@@ -149,7 +149,18 @@ app.mount("/files", StaticFiles(directory=EXPORTS_DIR), name="files")
 # Include routers
 app.include_router(datasets.router, prefix="/api/v1", tags=["Datasets"])
 app.include_router(upload.router, prefix="/api/v1", tags=["Upload & Analysis"])
-app.include_router(augmentation.router, prefix="/api/v1", tags=["Augmentation"])
+app.include_router(augmentation.router, prefix="/api/v1", tags=["  "
+""
+""
+""
+""
+""
+""
+""
+""
+""
+""
+""])
 app.include_router(labeling.router, prefix="/api/v1", tags=["Labeling"])
 from .train_endpoint import router as train_router
 app.include_router(train_router, prefix="/api/v1", tags=["Training"])
@@ -168,10 +179,11 @@ async def health():
         status["status"] = "degraded"
     try:
         import torch
-        status["gpu"] = torch.cuda.is_available()
-        if torch.cuda.is_available():
+        cuda_available = torch.cuda.is_available()
+        status["gpu"] = cuda_available
+        if cuda_available:
             status["gpu_name"] = torch.cuda.get_device_name(0)
-            status["gpu_memory_gb"] = round(torch.cuda.get_device_properties(0).total_mem / (1024**3), 1)
+            status["gpu_memory_gb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 1)
     except Exception:
         status["gpu"] = False
     status["disk_free_gb"] = round(shutil.disk_usage(str(STORAGE_ROOT)).free / (1024**3), 1)
@@ -181,6 +193,15 @@ async def health():
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Dataset Management Backend API"}
+
+@app.on_event("startup")
+async def startup_sweep():
+    from .api.routes.training import sweep_stale_jobs
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, sweep_stale_jobs)
+    except Exception as e:
+        print(f"[startup] sweep failed: {e}")
+
 
 if __name__ == "__main__":
     import uvicorn

@@ -20,13 +20,13 @@ docker start local-postgres 2>/dev/null || docker run -d \
   -e POSTGRES_DB=dataset_management \
   -e POSTGRES_USER=postgres \
   -e POSTGRES_PASSWORD=postgres \
-  -p 5432:5432 \
+  -p 5433:5432 \
   -v model_trainig_agents_postgres_data:/var/lib/postgresql/data \
   --restart unless-stopped \
   postgres:16-alpine
 
 echo "Waiting for PostgreSQL..."
-until pg_isready -h localhost -p 5432 -U postgres >/dev/null 2>&1; do
+until pg_isready -h localhost -p 5433 -U postgres >/dev/null 2>&1; do
     sleep 1
 done
 echo "PostgreSQL is ready."
@@ -71,7 +71,7 @@ echo "========================================="
 echo "  All services started!"
 echo "  Backend:  http://localhost:8001"
 echo "  Frontend: http://localhost:5173"
-echo "  Database: localhost:5432 (Docker)"
+echo "  Database: localhost:5433 (Docker)"
 echo "  API Docs: http://localhost:8001/docs"
 echo "========================================="
 echo ""

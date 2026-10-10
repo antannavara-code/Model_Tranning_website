@@ -1,4 +1,3 @@
-import os
 import shutil
 import json
 from pathlib import Path
@@ -199,35 +198,31 @@ async def upload_dataset(
     images_out.mkdir(parents=True, exist_ok=True)
     labels_out.mkdir(parents=True, exist_ok=True)
 
-    # Copy matched pairs first (this mirrors ExportService but ensures we have a local copy for DB rows)
+    # Move matched pairs (this mirrors ExportService but ensures we have a local copy for DB rows).
+    # We MOVE (not copy) from the temp extraction dirs because export already ran in step 6,
+    # which keeps peak disk usage down for very large datasets.
     for stem in sorted(stem_to_image.keys()):
         src_img = stem_to_image[stem]
         src_lbl = stem_to_label.get(stem)
         if not src_img.exists():
             continue
         dst_img = images_out / f"{stem}{src_img.suffix.lower()}"
-        try:
-            os.symlink(src_img, dst_img)
-        except OSError:
-            shutil.copy2(src_img, dst_img)
+        shutil.move(str(src_img), str(dst_img))
         if src_lbl and src_lbl.exists():
             dst_lbl = labels_out / f"{stem}.txt"
-            try:
-                os.symlink(src_lbl, dst_lbl)
-            except OSError:
-                shutil.copy2(src_lbl, dst_lbl)
+            shutil.move(str(src_lbl), str(dst_lbl))
 
     # Handle images with missing or empty labels (negative/empty cases)
-    for stem in report.missing_label_images + report.empty_label_images:
-        candidates = list(Path(extract_images_dir).glob(f"{stem}.*"))
+    # report.missing_label_images / empty_label_images contain full file NAMES
+    # (e.g. "copter_x.jpg"), so strip the extension before globbing.
+    for name in report.missing_label_images + report.empty_label_images:
+        stem = Path(name).stem
+        candidates = list(Path(extract_images_dir).rglob(f"{stem}.*"))
         if not candidates:
             continue
         src_img = candidates[0]
         dst_img = images_out / f"{stem}{src_img.suffix.lower()}"
-        try:
-            os.symlink(src_img, dst_img)
-        except OSError:
-            shutil.copy2(src_img, dst_img)
+        shutil.move(str(src_img), str(dst_img))
         # No label file is created for these images
 
     # ---------------------------------------------------------------------
